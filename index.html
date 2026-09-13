@@ -4964,7 +4964,8 @@ PANELS.wardrobe = function (sheet) {
    ════════════════════════════════════════════════════════════════ */
 
 let DB = null, ROOM = null;
-let online = { db: false, room: false, kind: 'none', peers: [], claims: {} };
+let online = { db: false, room: false, kind: 'none', peers: [], claims: {}, notes: [] };
+const note = (t) => { online.notes.push(t); if (online.notes.length > 8) online.notes.shift(); };
 
 const deviceId = (() => {
   try {
@@ -5190,6 +5191,44 @@ function peerActors() {
 
 /* ── the online chip in the HUD ─────────────────────────────── */
 
+/* What the connection is actually doing.
+ *
+ * "Offline" with no explanation is the worst thing this panel can say. Half a
+ * connection is a real state — the table can be readable while the live
+ * channel is refused — and the reason is almost always one of three things,
+ * so the panel says which. */
+function connectionReport() {
+  const box = el('div');
+  box.style.cssText = 'margin-top:12px;padding:12px 14px;border-radius:12px;'
+    + 'background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.2)';
+  box.dataset.rv = 'conn-report';
+  const line = (label, good, detail) => {
+    const r = el('div');
+    r.style.cssText = 'display:flex;align-items:center;gap:9px;font-size:12.5px;padding:3px 0';
+    const dot = el('span', 'livedot' + (good ? ' on' : ''));
+    if (!good) dot.style.background = '#fb7185';
+    r.append(dot, el('b', '', label));
+    r.querySelector('b').style.fontWeight = '600';
+    if (detail) { const d = el('span', '', detail);
+      d.style.cssText = 'color:var(--faint);margin-left:auto;font-size:11.5px';
+      r.appendChild(d); }
+    return r;
+  };
+  box.appendChild(el('div', 'eyebrow', 'Connection'));
+  box.appendChild(line('Shared database', online.db,
+    online.db ? 'connected' : 'not connected'));
+  box.appendChild(line('Live channel', online.room && ROOM && ROOM.connected && ROOM.connected(),
+    online.room && ROOM && ROOM.connected && ROOM.connected() ? 'connected' : 'not connected'));
+  if (online.notes.length) {
+    const log = el('div');
+    log.style.cssText = 'margin-top:9px;font-family:var(--mono);font-size:10.5px;'
+      + 'line-height:1.7;color:var(--faint);word-break:break-word';
+    online.notes.forEach(n => log.appendChild(el('div', '', n)));
+    box.appendChild(log);
+  }
+  return box;
+}
+
 function paintOnline() {
   // somebody claimed a character while the picker was open — redraw it, or
   // the next person will be offered a seat that has just gone
@@ -5211,6 +5250,7 @@ PANELS.online = function (sheet) {
   sheet.appendChild(el('h2', '', 'Who is on the campus'));
 
   if (!online.room && !online.db) {
+    sheet.appendChild(connectionReport());
     sheet.appendChild(el('p', 'body', 'This copy is running on its own. Everything works — '
       + 'the campus, the games, the instruments, your XP — but nobody else is connected '
       + 'to it, so you are the only person on the square.'));
@@ -5222,6 +5262,7 @@ PANELS.online = function (sheet) {
   sheet.appendChild(el('p', 'foot', online.kind === 'supabase'
     ? 'Shared through this society’s own Supabase project.'
     : 'Shared through Claude.'));
+  sheet.appendChild(connectionReport());
 
   const me = meMember();
   const rows = el('div', 'rows');
@@ -7217,8 +7258,8 @@ function openJam(onExit, opts) {
    ────────────────────────────────────────────────────────────── */
 
 const RV_CONFIG = {
-  supabaseUrl: 'https://lutagrbqmwcnsvykwudo.supabase.co', 
-  supabaseKey: 'sb_publishable_2qn-wlC2ozWMDLFfauKFYQ_v6Fb35D5',   // the anon / publishable key
+  supabaseUrl: '',   // e.g. 'https://abcdefgh.supabase.co'
+  supabaseKey: '',   // the anon / publishable key
 };
 
 /* Tracks the v2 line rather than one exact patch. Supabase moved to the
@@ -7229,7 +7270,21 @@ const RV_CONFIG = {
 const SUPA_LIB = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
 const CHANNEL = 'resoverse';
 
-const hasSupabase = () => !!(RV_CONFIG.supabaseUrl && RV_CONFIG.supabaseKey);
+/* Read the config forgivingly.
+ *
+ * These two values get pasted in by hand, from a dashboard, often on a phone.
+ * A stray space either side of the URL is the single most likely thing to go
+ * wrong, and it fails in the worst way — the page looks fine and quietly says
+ * "Offline". So trim it, drop a trailing slash, and accept the URL with or
+ * without the scheme. Being strict here buys nothing. */
+function supaUrl() {
+  let u = String(RV_CONFIG.supabaseUrl || '').trim().replace(/\/+$/, '');
+  if (!u) return '';
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  return u;
+}
+const supaKey = () => String(RV_CONFIG.supabaseKey || '').trim();
+const hasSupabase = () => !!(supaUrl() && supaKey());
 
 function loadScript(src) {
   return new Promise((resolve, reject) => {
@@ -7275,7 +7330,10 @@ function supabaseDb(client) {
   /* One pull at the start, then live changes. Pulling everything is fine:
      this table holds a society, not a data warehouse. */
   const ready = client.from('kv').select('path,data').then(({ data, error }) => {
-    if (error) throw error;
+    if (error) { note('Table read failed: ' + error.message
+      + (/relation .* does not exist/i.test(error.message)
+        ? '  — the SQL has not been run on this project.' : '')); throw error; }
+    note('Table read: ' + (data || []).length + ' rows.');
     (data || []).forEach(r => cache.set(r.path, r.data));
     listeners.forEach(l => l.fn(l.kind === 'doc' ? snapDoc(l.path) : snapCol(l.path)));
   });
@@ -7288,7 +7346,7 @@ function supabaseDb(client) {
       else cache.set(row.path, row.data);
       fire(row.path);
     })
-    .subscribe();
+    .subscribe(st => note('Table changes: ' + st));
 
   const write = async (path, data) => {
     cache.set(path, data); fire(path);                       // optimistic, so the UI never lags
@@ -7381,6 +7439,8 @@ function supabaseRoom(client) {
 
   let mine = {};
   chan.subscribe(status => {
+    note('Live channel: ' + status
+      + (status === 'CHANNEL_ERROR' ? '  — check Realtime is on for this project.' : ''));
     connected = status === 'SUBSCRIBED';
     connHandlers.forEach(h => h(connected));
     if (connected) chan.track({ presence: mine, at: Date.now() });
@@ -7422,17 +7482,22 @@ async function connectBackend() {
       if (db || room) return { db, room, kind: 'claude' };
     } catch { /* fall through and try Supabase */ }
   }
-  if (!hasSupabase()) return { db: null, room: null, kind: 'none' };
+  if (!hasSupabase()) { note('No Supabase project set in RV_CONFIG.');
+    return { db: null, room: null, kind: 'none' }; }
   try {
+    note('Project: ' + supaUrl());
     if (!window.supabase) await loadScript(SUPA_LIB);
-    const client = window.supabase.createClient(RV_CONFIG.supabaseUrl, RV_CONFIG.supabaseKey, {
+    note('Library loaded.');
+    const client = window.supabase.createClient(supaUrl(), supaKey(), {
       auth: { persistSession: false },
       realtime: { params: { eventsPerSecond: 12 } },
     });
     return { db: supabaseDb(client), room: supabaseRoom(client), kind: 'supabase' };
   } catch (e) {
     // a misconfigured project must not take the game down with it
-    console.warn('Resoverse: shared world unavailable —', e && e.message);
+    const why = (e && e.message) || String(e);
+    console.warn('Resoverse: shared world unavailable —', why);
+    note('Could not start Supabase: ' + why);
     return { db: null, room: null, kind: 'none' };
   }
 }
