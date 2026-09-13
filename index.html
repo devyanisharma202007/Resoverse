@@ -1649,9 +1649,9 @@ function render(target, w, cssW, cssH) {
 <script>
 /* ════════════════════════════════════════════════════════════════
    RESO RUSH — an original match-3 in Resonance tiles.
-   Not a clone: seven tiles of our own, special tiles for 4, 5 and
-   L/T shapes, cascades that multiply, and XP paid into the one
-   progression system rather than a second currency.
+   Not a clone: seven tiles of our own, long runs that pay more than
+   the same tiles split into threes, cascades that multiply, and XP
+   paid into the one progression system rather than a second currency.
    ════════════════════════════════════════════════════════════════ */
 
 const TILES = [
@@ -1671,7 +1671,10 @@ const RUSH_LEVELS = [
   { n:3, mode:'Time Rush',target:5200,  seconds:60 },
   { n:4, mode:'Classic',  target:7000,  moves:24 },
   { n:5, mode:'Time Rush',target:8000,  seconds:75 },
-  { n:6, mode:'Challenge',target:9500,  moves:26 },
+  // Challenge is the only level that runs both limits at once — a clock AND a
+  // move count. It was labelled Challenge and played exactly like Classic,
+  // which is a lie printed on the level card.
+  { n:6, mode:'Challenge',target:9500,  moves:26, seconds:110 },
 ];
 
 function newBoard() {
@@ -1688,16 +1691,24 @@ function newBoard() {
   return b;
 }
 
+/* Returns the set of matched squares, with the length of the LONGEST single
+   run hung off it as `.longest`. The scorer used to work off hit.size, which
+   cannot tell a five-in-a-row from two separate threes somewhere else on the
+   board — so lining up five paid exactly the same as getting lucky twice. */
 function findMatches(b) {
   const hit = new Set();
+  let longest = 0;
   for (let y=0;y<N;y++) for (let x=0;x<N-2;x++){
     const t=b[y][x]; if (t<0) continue;
     if (b[y][x+1]===t && b[y][x+2]===t){ let k=x;
-      while (k<N && b[y][k]===t){ hit.add(y*N+k); k++; } } }
+      while (k<N && b[y][k]===t){ hit.add(y*N+k); k++; }
+      longest = Math.max(longest, k-x); } }
   for (let x=0;x<N;x++) for (let y=0;y<N-2;y++){
     const t=b[y][x]; if (t<0) continue;
     if (b[y+1][x]===t && b[y+2][x]===t){ let k=y;
-      while (k<N && b[k][x]===t){ hit.add(k*N+x); k++; } } }
+      while (k<N && b[k][x]===t){ hit.add(k*N+x); k++; }
+      longest = Math.max(longest, k-y); } }
+  hit.longest = longest;
   return hit;
 }
 
@@ -1720,6 +1731,9 @@ function hasMove(b){
   return false;
 }
 
+const limitLabel = L => [L.moves && L.moves+' moves', L.seconds && L.seconds+'s']
+  .filter(Boolean).join(' · ');
+
 function openResoRush(onExit) {
   const lvlIdx = { i: 0 };
   const host = document.createElement('div'); host.className='gamewrap'; host.dataset.rv='game';
@@ -1741,7 +1755,7 @@ function openResoRush(onExit) {
     RUSH_LEVELS.forEach((L,i)=>{
       const b = el('button','row'); b.style.cssText='text-align:left;border:1px solid rgba(139,92,246,.3);cursor:pointer';
       b.innerHTML = `<span class="rank">${L.n}</span><span style="flex:1">
-        <b>${L.mode}</b><em>${L.target.toLocaleString()} pts · ${L.moves?L.moves+' moves':L.seconds+'s'}</em></span>`;
+        <b>${L.mode}</b><em>${L.target.toLocaleString()} pts · ${limitLabel(L)}</em></span>`;
       b.onclick = () => { lvlIdx.i = i; play(); };
       grid.appendChild(b); });
     wrap.appendChild(el('p','foot','Sound is synthesised in the browser — no audio files, nothing licensed.'));
@@ -1750,9 +1764,18 @@ function openResoRush(onExit) {
   function play() {
     const L = RUSH_LEVELS[lvlIdx.i];
     let board = newBoard(), score=0, moves=L.moves||0, secs=L.seconds||0;
-    let best=1, sel=null, busy=false, over=false;
+    let best=1, sel=null, busy=false, over=false, timer=null;
 
-    host.innerHTML=''; host.appendChild(topBar('RESO RUSH', close, menu));
+    /* Leaving a level has to kill its clock. It didn't: the interval carried on
+       after Leave and after Levels, so a minute later a trombone played while
+       you were walking round the campus, XP was paid for a level you had
+       abandoned, a phantom score went to the leaderboard, and the results card
+       was drawn over whatever you had opened in the meantime. `over` also stops
+       any cascade still resolving from calling finish() behind you. */
+    const stop = () => { over = true; if (timer) clearInterval(timer); timer = null; };
+
+    host.innerHTML='';
+    host.appendChild(topBar('RESO RUSH', () => { stop(); close(); }, () => { stop(); menu(); }));
     const body = el('div','gbody'); host.appendChild(body);
 
     const boardEl = el('div','board');
@@ -1762,9 +1785,10 @@ function openResoRush(onExit) {
     body.appendChild(boardEl); body.appendChild(stats);
 
     const sScore = statBox('Score','0'), sTarget = statBox('Target', L.target.toLocaleString());
-    const sLeft  = statBox(L.moves?'Moves':'Time', String(L.moves||L.seconds));
+    const sMoves = L.moves   ? statBox('Moves', String(L.moves))   : null;
+    const sTime  = L.seconds ? statBox('Time',  String(L.seconds)) : null;
     const sCombo = statBox('Best combo','x1');
-    [sScore,sTarget,sLeft,sCombo].forEach(s=>stats.appendChild(s.node));
+    [sScore,sTarget,sMoves,sTime,sCombo].filter(Boolean).forEach(s=>stats.appendChild(s.node));
     const hint = el('p','foot','Tap two neighbours to swap them.'); stats.appendChild(hint);
 
     const cells = [];
@@ -1780,7 +1804,9 @@ function openResoRush(onExit) {
       c.classList.toggle('sel', !!sel && sel.x===x && sel.y===y); } };
 
     const bump = () => { sScore.set(score.toLocaleString());
-      sLeft.set(String(L.moves?moves:Math.ceil(secs))); sCombo.set('x'+best); };
+      sMoves && sMoves.set(String(Math.max(0,moves)));
+      sTime  && sTime.set(String(Math.max(0,Math.ceil(secs))));
+      sCombo.set('x'+best); };
 
     function pick(x,y){ if (busy||over) return;
       if (!sel){ sel={x,y}; paint(); return; }
@@ -1806,7 +1832,8 @@ function openResoRush(onExit) {
         chain++;
         best = Math.max(best, chain);
         const mult = chain>=4?4 : chain>=3?3 : chain>=2?2 : 1;
-        const gained = hit.size*60*mult + (hit.size>3 ? (hit.size-3)*90 : 0);
+        const run = hit.longest || 3;
+        const gained = hit.size*60*mult + (run>3 ? (run-3)*140*mult : 0);
         score += gained;
         chord(chain);
         hit.forEach(i=>cells[i].classList.add('pop'));
@@ -1830,13 +1857,14 @@ function openResoRush(onExit) {
       if (L.moves && moves<=0){ over=true; finish(false); }
     }
 
-    let timer = null;
     if (L.seconds){ timer = setInterval(()=>{ if (over||busy) return;
       secs -= .25; bump();
-      if (secs<=0){ over=true; clearInterval(timer); finish(score>=L.target); } }, 250); }
+      if (secs<=0){ secs=0; bump(); over=true; clearInterval(timer); timer=null;
+        finish(score>=L.target); } }, 250); }
 
     function finish(won){
-      if (timer) clearInterval(timer);
+      if (timer) { clearInterval(timer); timer = null; }
+      if (!host.isConnected) return;   // the level was left; pay nothing, draw nothing
       const earned = Math.round(score/260) + best*8 + (won?40:0);
       grantXp(earned);
       submitScore('rush', state.playerId, score, L.n);
@@ -1862,6 +1890,15 @@ function openResoRush(onExit) {
       const out = el('button','btn ghost','Back to Arcade'); out.style.flex='1'; out.onclick = close;
       btns.append(again,out); card.appendChild(btns); back.appendChild(card); host.appendChild(back);
     }
+
+    // A small handle for the test harness. Reading the live board beats
+    // guessing a legal swap from the glyphs on screen.
+    window.__rush = {
+      board: () => board,
+      timerAlive: () => !!timer,
+      force: how => { if (how === 'win') { score = L.target; } else { moves = 0; secs = 0; }
+        bump(); check(); },
+    };
 
     paint(); bump();
   }
@@ -6458,8 +6495,12 @@ PANELS.guide = function (sheet) {
   font-family:var(--mono);font-size:8px;color:#8f86b5}
 .bkey.down{background:linear-gradient(180deg,#8b5cf6,#5b3aa8);color:#fff}
 
-/* fretboard */
-.board{display:flex;flex-direction:column;gap:5px;touch-action:none}
+/* fretboard.
+   This was called .board, which is also Reso Rush's match-3 grid. Being
+   defined later in the file it won on specificity ties and turned the 8x8
+   board into a single 64-tile column — the game was unplayable. Two different
+   things must not share a class name. */
+.fretboard{display:flex;flex-direction:column;gap:5px;touch-action:none}
 .strng{display:flex;gap:5px;align-items:center}
 .strng > b{width:26px;font-family:var(--mono);font-size:10px;color:var(--faint);text-align:right}
 .fret{flex:1;height:30px;border-radius:7px;background:rgba(255,255,255,.05);
@@ -6992,7 +7033,7 @@ function openJam(onExit, opts) {
     }
 
     // frets
-    const board = el('div', 'board');
+    const board = el('div', 'fretboard');
     board.dataset.rv = 'fretboard';
     inst.strings.forEach((open, si) => {
       const row = el('div', 'strng');
@@ -7316,8 +7357,8 @@ function openJam(onExit, opts) {
    ────────────────────────────────────────────────────────────── */
 
 const RV_CONFIG = {
-  supabaseUrl: 'https://lutagrbqmwcnsvykwudo.supabase.co',
-  supabaseKey: 'sb_publishable_2qn-wlC2ozWMDLFfauKFYQ_v6Fb35D5',
+  supabaseUrl: 'https://lutagrbqmwcnsvykwudo.supabase.co',   // e.g. 'https://abcdefgh.supabase.co'
+  supabaseKey: 'sb_publishable_2qn-wlC2ozWMDLFfauKFYQ_v6Fb35D5',   // the anon / publishable key
 };
 
 /* Tracks the v2 line rather than one exact patch. Supabase moved to the
