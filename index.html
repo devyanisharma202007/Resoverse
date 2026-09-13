@@ -3595,13 +3595,21 @@ function pickCharacter() {
     b.querySelector('em').style.cssText = 'font-size:11.5px;color:var(--faint);font-style:normal;text-align:center';
     b.onmouseenter = () => { b.style.borderColor = m.appearance.outfit.accent; };
     b.onmouseleave = () => { b.style.borderColor = 'rgba(139,92,246,.28)'; };
-    if (typeof claimedByOther === 'function' && claimedByOther(m.id)) {
+    const live = typeof heldLive === 'function' && heldLive(m.id);
+    const stale = typeof heldStale === 'function' && heldStale(m.id);
+    if (live) {
       b.classList.add('taken');
       b.disabled = true;
-      const who = el('span', 'badge-mine', 'TAKEN');
+      const who = el('span', 'badge-mine', 'PLAYING');
       who.style.color = 'var(--faint)';
       b.appendChild(who);
-      b.title = m.name + ' is being played by somebody else';
+      b.title = m.name + ' is on the campus right now';
+    } else if (stale) {
+      // used before, nobody behind it — say so and let them take it
+      const who = el('span', 'badge-mine', 'FREE');
+      who.style.color = 'var(--teal)';
+      b.appendChild(who);
+      b.title = 'Last played on another device — tap to take over';
     } else if (typeof claimedByMe === 'function' && claimedByMe(m.id)) {
       b.appendChild(el('span', 'badge-mine', 'YOURS'));
     }
@@ -4983,12 +4991,24 @@ let liveMembers = new Set();   // characters somebody else is playing right now
 const CLAIM_STALE_MS = 1000 * 60 * 60 * 24 * 14;   // a fortnight away and the seat frees up
 const claimOf = id => online.claims[id];
 const claimedByMe = id => { const c = claimOf(id); return !!c && c.device === deviceId; };
-const claimedByOther = id => {
-  // somebody playing them right now counts even before their claim lands
-  if (liveMembers.has(id) && id !== state.playerId) return true;
+/* Who is actually unavailable.
+ *
+ * A claim is a record that some browser once picked this member. It is NOT
+ * proof that anybody is playing them now — and treating it as proof locked
+ * the whole society out: three characters claimed from three of Devyani's
+ * own devices, and the fourth person to open the link found every tile
+ * greyed out with no way in.
+ *
+ * So only somebody who is on the campus RIGHT NOW holds a character. A claim
+ * with nobody behind it is a soft hold: the picker shows who had it and lets
+ * the next person take it. */
+const heldLive = id => liveMembers.has(id) && id !== state.playerId;
+const heldStale = id => {
+  if (heldLive(id)) return false;
   const c = claimOf(id);
   return !!c && c.device !== deviceId && Date.now() - (c.at || 0) < CLAIM_STALE_MS;
 };
+const claimedByOther = id => heldLive(id);
 
 /* ── connect ─────────────────────────────────────────────────────
    Nothing here blocks the page. The world is already running by the
@@ -5058,9 +5078,9 @@ function watchClaims() {
 }
 
 async function claimCharacter(memberId) {
-  if (liveMembers.has(memberId)) return { ok: false, by: 'somebody already on the campus' };
+  // only a person actually on the campus can block you
+  if (heldLive(memberId)) return { ok: false, by: 'somebody already on the campus' };
   if (!DB) return { ok: true, local: true };
-  if (claimedByOther(memberId)) return { ok: false, by: (claimOf(memberId) || {}).name || 'somebody' };
   try {
     // release whatever else this device was holding
     Object.entries(online.claims).forEach(([id, c]) => {
@@ -5299,13 +5319,28 @@ PANELS.online = function (sheet) {
   MEMBERS.forEach(m => {
     const c = claimOf(m.id);
     const r = rowNode(null, m.appearance, m.name,
-      claimedByMe(m.id) ? 'Yours' : c ? 'Taken' : 'Free', null);
+      claimedByMe(m.id) ? 'Yours' : heldLive(m.id) ? 'On the campus now'
+        : c ? 'Last used on another device' : 'Free', null);
     if (claimedByMe(m.id)) r.appendChild(el('span', 'chip on', 'You'));
-    else if (claimedByOther(m.id)) { r.style.opacity = '.55'; r.appendChild(el('span', 'chip', 'Taken')); }
+    else if (heldLive(m.id)) { r.style.opacity = '.55'; r.appendChild(el('span', 'chip', 'Playing now')); }
     else r.appendChild(el('span', 'chip on', 'Free'));
     cl.appendChild(r);
   });
   sheet.appendChild(cl);
+
+  const freeAll = el('button', 'btn ghost', 'Free every character');
+  freeAll.dataset.rv = 'free-all';
+  freeAll.style.cssText = 'margin-top:14px;margin-right:8px';
+  freeAll.onclick = async () => {
+    if (freeAll.dataset.armed !== '1') { freeAll.dataset.armed = '1';
+      freeAll.textContent = 'Tap again — this clears everyone'; return; }
+    if (!DB) return;
+    await Promise.all(Object.keys(online.claims)
+      .map(id => DB.doc('claims/' + id).delete().catch(() => {})));
+    toast('Every character is free again');
+    openPanel('online');
+  };
+  sheet.appendChild(freeAll);
 
   if (claimedByMe(state.playerId)) {
     const rel = el('button', 'btn ghost', 'Let go of ' + me.name);
