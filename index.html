@@ -7485,6 +7485,11 @@ function supabaseRoom(client) {
 
   function build() {
     if (dead) return;
+    /* Tearing the old channel down makes it report CLOSED. That is us doing
+       it, not the network — and treating it as a drop is what put this in a
+       loop: rebuild → CLOSED → rebuild, every few seconds, forever. Each
+       channel therefore only listens to its own status, and a channel that is
+       no longer the current one is ignored. */
     if (chan) { try { client.removeChannel(chan); } catch { /* already gone */ } chan = null; }
     chan = client.channel(CHANNEL, {
       config: { presence: { key: deviceId }, broadcast: { self: false } },
@@ -7501,14 +7506,16 @@ function supabaseRoom(client) {
           isMe: false, sameTab: false, kind: 'viewer' });
       });
     });
-    chan.subscribe(status => {
+    const own = chan;
+    own.subscribe(status => {
+      if (own !== chan) return;                    // a channel we already replaced
       note('Live channel: ' + status
         + (status === 'CHANNEL_ERROR' ? '  — check Realtime is on for this project.' : ''));
       if (status === 'SUBSCRIBED') {
         retry = 0;
         setConnected(true);
         lastTrack = 0;
-        chan.track({ presence: mine, at: Date.now() }).catch(() => {});
+        own.track({ presence: mine, at: Date.now() }).catch(() => {});
         announce();
       } else {
         setConnected(false);
@@ -7518,7 +7525,7 @@ function supabaseRoom(client) {
   }
 
   function schedule(immediate) {
-    if (dead || pending) return;
+    if (dead || pending || connected) return;
     const wait = immediate ? 250 : Math.min(12000, 800 * Math.pow(2, retry++));
     pending = setTimeout(() => { pending = 0; build(); }, wait);
   }
