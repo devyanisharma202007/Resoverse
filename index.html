@@ -7221,7 +7221,12 @@ const RV_CONFIG = {
   supabaseKey: '',   // the anon / publishable key
 };
 
-const SUPA_LIB = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js';
+/* Tracks the v2 line rather than one exact patch. Supabase moved to the
+   sb_publishable_… key format, and only the newer clients accept it; pinning
+   an old patch here would mean the setup instructions hand you a key the
+   library rejects. The major version is pinned, which is the part that
+   guarantees the API below keeps working. */
+const SUPA_LIB = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
 const CHANNEL = 'resoverse';
 
 const hasSupabase = () => !!(RV_CONFIG.supabaseUrl && RV_CONFIG.supabaseKey);
