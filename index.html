@@ -5217,8 +5217,13 @@ function connectionReport() {
   box.appendChild(el('div', 'eyebrow', 'Connection'));
   box.appendChild(line('Shared database', online.db,
     online.db ? 'connected' : 'not connected'));
-  box.appendChild(line('Live channel', online.room && ROOM && ROOM.connected && ROOM.connected(),
-    online.room && ROOM && ROOM.connected && ROOM.connected() ? 'connected' : 'not connected'));
+  const liveOk = online.room && ROOM && ROOM.connected && ROOM.connected();
+  box.appendChild(line('Live channel', liveOk, liveOk ? 'connected' : 'not connected'));
+  if (ROOM && ROOM.stats) { const st = ROOM.stats();
+    box.appendChild(line('Messages', st.got > 0 || st.sent > 0,
+      st.sent + ' sent, ' + st.got + ' received')); }
+  box.appendChild(line('People here now', online.peers.length > 0,
+    online.peers.length ? online.peers.length + ' besides you' : 'nobody else right now'));
   if (online.notes.length) {
     const log = el('div');
     log.style.cssText = 'margin-top:9px;font-family:var(--mono);font-size:10.5px;'
@@ -7269,6 +7274,7 @@ const RV_CONFIG = {
    guarantees the API below keeps working. */
 const SUPA_LIB = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
 const CHANNEL = 'resoverse';
+const ROOM_TOPICS = ['say', 'note'];   // must be known before the channel subscribes
 
 /* Read the config forgivingly.
  *
@@ -7430,11 +7436,21 @@ function supabaseRoom(client) {
   chan.on('presence', { event: 'sync' }, announce);
   chan.on('presence', { event: 'join' }, announce);
   chan.on('presence', { event: 'leave' }, announce);
-  chan.on('broadcast', { event: '*' }, payload => {
-    const fn = topicHandlers.get(payload.event);
-    if (!fn) return;
-    fn({ topic: payload.event, data: payload.payload, peer: 'peer', by: null,
-      isMe: false, sameTab: false, kind: 'viewer' });
+  /* Every topic the page uses, registered by name before subscribing.
+   *
+   * Two things bite here. Supabase matches the broadcast event exactly — a
+   * '*' listener quietly receives nothing, which looks precisely like a
+   * working connection that never delivers a message. And listeners have to
+   * be attached before subscribe(), while the jam room does not open until
+   * much later. So both topics go on now and the handlers hang off a map
+   * that fills in whenever the feature that wants them wakes up. */
+  ROOM_TOPICS.forEach(topic => {
+    chan.on('broadcast', { event: topic }, payload => {
+      const fn = topicHandlers.get(topic);
+      if (!fn) return;
+      fn({ topic, data: payload.payload, peer: (payload.payload || {}).from || 'peer',
+        by: null, isMe: false, sameTab: false, kind: 'viewer' });
+    });
   });
 
   let mine = {};
@@ -7446,13 +7462,25 @@ function supabaseRoom(client) {
     if (connected) chan.track({ presence: mine, at: Date.now() });
   });
 
+  let sent = 0, got = 0;
+  ROOM_TOPICS.forEach(t => {
+    const prev = topicHandlers.get(t);
+    void prev;
+  });
+
   return {
+    stats: () => ({ sent, got }),
     emit: async (topic, data) => {
       if (!connected) return;
+      if (ROOM_TOPICS.indexOf(topic) < 0) {
+        console.warn('Resoverse: topic "' + topic + '" is not registered — add it to ROOM_TOPICS');
+        return;
+      }
+      sent++;
       await chan.send({ type: 'broadcast', event: topic, payload: data });
     },
     on(topic, handler) {
-      topicHandlers.set(topic, handler);
+      topicHandlers.set(topic, msg => { got++; handler(msg); });
       return () => topicHandlers.delete(topic);
     },
     presence: async patch => {
