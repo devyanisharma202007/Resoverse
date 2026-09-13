@@ -7444,7 +7444,7 @@ function supabaseRoom(client) {
     config: { presence: { key: deviceId }, broadcast: { self: false } },
   });
 
-  let peersHandler = null, connected = false;
+  let peersHandler = null, connected = false, lastTrack = 0;
   const connHandlers = [];
   const topicHandlers = new Map();
 
@@ -7489,13 +7489,36 @@ function supabaseRoom(client) {
   });
 
   let mine = {};
-  chan.subscribe(status => {
+  let retry = 0, rejoining = false;
+
+  /* Realtime channels drop — a sleeping phone, a flaky campus network, a
+     server-side close. Without this the page joins once, loses it, and stays
+     dead until somebody reloads. With it, it comes back by itself. */
+  const rejoin = () => {
+    if (rejoining) return;
+    rejoining = true;
+    const wait = Math.min(15000, 1000 * Math.pow(2, retry++));
+    setTimeout(async () => {
+      rejoining = false;
+      try { await chan.unsubscribe(); } catch { /* already gone */ }
+      note('Live channel: rejoining…');
+      chan.subscribe(onStatus);
+    }, wait);
+  };
+
+  const onStatus = status => {
     note('Live channel: ' + status
       + (status === 'CHANNEL_ERROR' ? '  — check Realtime is on for this project.' : ''));
     connected = status === 'SUBSCRIBED';
     connHandlers.forEach(h => h(connected));
-    if (connected) chan.track({ presence: mine, at: Date.now() });
-  });
+    if (connected) {
+      retry = 0;
+      chan.track({ presence: mine, at: Date.now() }).catch(() => {});
+    } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+      rejoin();
+    }
+  };
+  chan.subscribe(onStatus);
 
   let sent = 0, got = 0;
   ROOM_TOPICS.forEach(t => {
@@ -7519,8 +7542,19 @@ function supabaseRoom(client) {
       return () => topicHandlers.delete(topic);
     },
     presence: async patch => {
-      mine = Object.assign({}, mine, patch);
-      if (connected) await chan.track({ presence: mine, at: Date.now() });
+      const next = Object.assign({}, mine, patch);
+      /* Presence was being re-sent every 900ms whether or not anything had
+         changed, which is a lot of traffic for a person standing still and
+         the quickest way to be rate-limited off the channel. Send it when it
+         differs, and at most a few times a second while actually moving. */
+      const changed = JSON.stringify(next) !== JSON.stringify(mine);
+      mine = next;
+      if (!connected) return;
+      const now = Date.now();
+      if (!changed && now - lastTrack < 20000) return;   // a keepalive, no more
+      if (changed && now - lastTrack < 700) return;      // and never faster than this
+      lastTrack = now;
+      try { await chan.track({ presence: mine, at: now }); } catch { /* the rejoin handles it */ }
     },
     peers: peerList,
     onPeers(handler) { peersHandler = handler; announce(); return () => { peersHandler = null; }; },
@@ -7551,9 +7585,12 @@ async function connectBackend() {
     note('Project: ' + supaUrl());
     if (!window.supabase) await loadScript(SUPA_LIB);
     note('Library loaded.');
+    /* No eventsPerSecond override. Asking for more than the project's plan
+       allows gets the channel closed by the server a few seconds after it
+       joins — which looks exactly like "it connected and then went Offline",
+       and is what it was doing. The default is plenty for a society. */
     const client = window.supabase.createClient(supaUrl(), supaKey(), {
       auth: { persistSession: false },
-      realtime: { params: { eventsPerSecond: 12 } },
     });
     return { db: supabaseDb(client), room: supabaseRoom(client), kind: 'supabase' };
   } catch (e) {
