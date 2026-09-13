@@ -5328,6 +5328,15 @@ PANELS.online = function (sheet) {
   });
   sheet.appendChild(cl);
 
+  if (ROOM && ROOM.reconnect) {
+    const again = el('button', 'btn ghost', 'Reconnect');
+    again.dataset.rv = 'reconnect';
+    again.style.cssText = 'margin-top:14px;margin-right:8px';
+    again.onclick = () => { ROOM.reconnect(); toast('Reconnecting…');
+      setTimeout(() => openPanel('online'), 1500); };
+    sheet.appendChild(again);
+  }
+
   const freeAll = el('button', 'btn ghost', 'Free every character');
   freeAll.dataset.rv = 'free-all';
   freeAll.style.cssText = 'margin-top:14px;margin-right:8px';
@@ -7440,121 +7449,122 @@ function supabaseDb(client) {
 /* ── ROOM: presence and broadcast on one realtime channel ── */
 
 function supabaseRoom(client) {
-  const chan = client.channel(CHANNEL, {
-    config: { presence: { key: deviceId }, broadcast: { self: false } },
-  });
-
-  let peersHandler = null, connected = false, lastTrack = 0;
-  const connHandlers = [];
+  /* Realtime, built to be dropped and picked back up.
+   *
+   * A phone does not stay connected. Lock the screen, switch apps, walk into
+   * a lift, and iOS suspends the page and the socket dies — often without the
+   * client ever hearing about it. The first version subscribed once and hoped;
+   * the second tried to re-subscribe the same channel object, which supabase-js
+   * will not do once it has been torn down. So the channel is disposable: when
+   * it is gone, a brand new one is built. Coming back from a locked phone is
+   * the normal case here, not an error case. */
+  let chan = null, connected = false, mine = {}, lastTrack = 0;
+  let retry = 0, pending = 0, dead = false;
   const topicHandlers = new Map();
+  const connHandlers = [];
+  let peersHandler = null;
+  let sent = 0, got = 0;
 
   const peerList = () => {
-    const st = chan.presenceState() || {};
-    const out = [];
-    Object.entries(st).forEach(([peer, entries]) => {
+    if (!chan) return [];
+    let st = {};
+    try { st = chan.presenceState() || {}; } catch { return []; }
+    return Object.entries(st).map(([peer, entries]) => {
       const latest = entries[entries.length - 1] || {};
-      out.push({
-        peer, by: null, isMe: peer === deviceId, sameTab: false, kind: 'viewer',
-        presence: latest.presence || {},
-        updatedAt: latest.at || Date.now(),
+      return { peer, by: null, isMe: peer === deviceId, sameTab: false, kind: 'viewer',
+        presence: latest.presence || {}, updatedAt: latest.at || Date.now() };
+    });
+  };
+  const announce = () => { if (peersHandler)
+    peersHandler({ peers: peerList(), joined: [], left: [], updated: [] }); };
+  const setConnected = v => {
+    if (connected === v) return;
+    connected = v;
+    connHandlers.forEach(h => { try { h(v); } catch {} });
+  };
+
+  function build() {
+    if (dead) return;
+    if (chan) { try { client.removeChannel(chan); } catch { /* already gone */ } chan = null; }
+    chan = client.channel(CHANNEL, {
+      config: { presence: { key: deviceId }, broadcast: { self: false } },
+    });
+    chan.on('presence', { event: 'sync' }, announce);
+    chan.on('presence', { event: 'join' }, announce);
+    chan.on('presence', { event: 'leave' }, announce);
+    ROOM_TOPICS.forEach(topic => {
+      chan.on('broadcast', { event: topic }, payload => {
+        const fn = topicHandlers.get(topic);
+        if (!fn) return;
+        got++;
+        fn({ topic, data: payload.payload, peer: 'peer', by: null,
+          isMe: false, sameTab: false, kind: 'viewer' });
       });
     });
-    return out;
-  };
-
-  const announce = () => {
-    if (!peersHandler) return;
-    const peers = peerList();
-    peersHandler({ peers, joined: [], left: [], updated: [] });
-  };
-
-  chan.on('presence', { event: 'sync' }, announce);
-  chan.on('presence', { event: 'join' }, announce);
-  chan.on('presence', { event: 'leave' }, announce);
-  /* Every topic the page uses, registered by name before subscribing.
-   *
-   * Two things bite here. Supabase matches the broadcast event exactly — a
-   * '*' listener quietly receives nothing, which looks precisely like a
-   * working connection that never delivers a message. And listeners have to
-   * be attached before subscribe(), while the jam room does not open until
-   * much later. So both topics go on now and the handlers hang off a map
-   * that fills in whenever the feature that wants them wakes up. */
-  ROOM_TOPICS.forEach(topic => {
-    chan.on('broadcast', { event: topic }, payload => {
-      const fn = topicHandlers.get(topic);
-      if (!fn) return;
-      fn({ topic, data: payload.payload, peer: (payload.payload || {}).from || 'peer',
-        by: null, isMe: false, sameTab: false, kind: 'viewer' });
+    chan.subscribe(status => {
+      note('Live channel: ' + status
+        + (status === 'CHANNEL_ERROR' ? '  — check Realtime is on for this project.' : ''));
+      if (status === 'SUBSCRIBED') {
+        retry = 0;
+        setConnected(true);
+        lastTrack = 0;
+        chan.track({ presence: mine, at: Date.now() }).catch(() => {});
+        announce();
+      } else {
+        setConnected(false);
+        if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') schedule();
+      }
     });
-  });
+  }
 
-  let mine = {};
-  let retry = 0, rejoining = false;
+  function schedule(immediate) {
+    if (dead || pending) return;
+    const wait = immediate ? 250 : Math.min(12000, 800 * Math.pow(2, retry++));
+    pending = setTimeout(() => { pending = 0; build(); }, wait);
+  }
 
-  /* Realtime channels drop — a sleeping phone, a flaky campus network, a
-     server-side close. Without this the page joins once, loses it, and stays
-     dead until somebody reloads. With it, it comes back by itself. */
-  const rejoin = () => {
-    if (rejoining) return;
-    rejoining = true;
-    const wait = Math.min(15000, 1000 * Math.pow(2, retry++));
-    setTimeout(async () => {
-      rejoining = false;
-      try { await chan.unsubscribe(); } catch { /* already gone */ }
-      note('Live channel: rejoining…');
-      chan.subscribe(onStatus);
-    }, wait);
-  };
+  /* Three things bring it back, because on a phone none of them alone is
+     reliable: the tab becoming visible again, the network returning, and a
+     slow heartbeat for the times nothing fires at all. */
+  const wake = () => { if (!connected) { retry = 0; schedule(true); } };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) wake(); });
+  addEventListener('focus', wake);
+  addEventListener('online', wake);
+  addEventListener('pageshow', wake);
+  setInterval(() => { if (!connected) schedule(); }, 8000);
 
-  const onStatus = status => {
-    note('Live channel: ' + status
-      + (status === 'CHANNEL_ERROR' ? '  — check Realtime is on for this project.' : ''));
-    connected = status === 'SUBSCRIBED';
-    connHandlers.forEach(h => h(connected));
-    if (connected) {
-      retry = 0;
-      chan.track({ presence: mine, at: Date.now() }).catch(() => {});
-    } else if (status === 'CLOSED' || status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-      rejoin();
-    }
-  };
-  chan.subscribe(onStatus);
-
-  let sent = 0, got = 0;
-  ROOM_TOPICS.forEach(t => {
-    const prev = topicHandlers.get(t);
-    void prev;
-  });
+  build();
 
   return {
     stats: () => ({ sent, got }),
+    reconnect: () => { retry = 0; schedule(true); },
     emit: async (topic, data) => {
-      if (!connected) return;
+      if (!connected || !chan) return;
       if (ROOM_TOPICS.indexOf(topic) < 0) {
         console.warn('Resoverse: topic "' + topic + '" is not registered — add it to ROOM_TOPICS');
         return;
       }
       sent++;
-      await chan.send({ type: 'broadcast', event: topic, payload: data });
+      try { await chan.send({ type: 'broadcast', event: topic, payload: data }); }
+      catch { schedule(true); }
     },
     on(topic, handler) {
-      topicHandlers.set(topic, msg => { got++; handler(msg); });
+      topicHandlers.set(topic, handler);
       return () => topicHandlers.delete(topic);
     },
     presence: async patch => {
       const next = Object.assign({}, mine, patch);
-      /* Presence was being re-sent every 900ms whether or not anything had
-         changed, which is a lot of traffic for a person standing still and
-         the quickest way to be rate-limited off the channel. Send it when it
-         differs, and at most a few times a second while actually moving. */
+      /* Only when something changed, and never faster than a few times a
+         second. Re-sending a standing player's position every 900ms is a lot
+         of traffic and the quickest way to be shut off the channel. */
       const changed = JSON.stringify(next) !== JSON.stringify(mine);
       mine = next;
-      if (!connected) return;
+      if (!connected || !chan) return;
       const now = Date.now();
-      if (!changed && now - lastTrack < 20000) return;   // a keepalive, no more
-      if (changed && now - lastTrack < 700) return;      // and never faster than this
+      if (!changed && now - lastTrack < 20000) return;
+      if (changed && now - lastTrack < 700) return;
       lastTrack = now;
-      try { await chan.track({ presence: mine, at: now }); } catch { /* the rejoin handles it */ }
+      try { await chan.track({ presence: mine, at: now }); } catch { schedule(true); }
     },
     peers: peerList,
     onPeers(handler) { peersHandler = handler; announce(); return () => { peersHandler = null; }; },
