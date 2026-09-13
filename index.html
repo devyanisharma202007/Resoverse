@@ -1426,9 +1426,13 @@ function step(w, dt) {
       continue; }
     const dx=a.goal.x-a.x, dy=a.goal.y-a.y;
     if (Math.hypot(dx,dy)<.25){ a.goal=null; a.wait=1.5+Math.random()*6;
-      // only somebody with a file says anything; an invented student muttering
-      // in the log was the loudest thing in the world and meant nothing
-      if (a.characterId && Math.random()>.9){ const text=CHATTER[Math.floor(Math.random()*CHATTER.length)];
+      /* Scripted lines from the members standing about.
+       *
+       * They filled the square while the society was three people and nobody
+       * else was ever online. Now that real people are in here they read as
+       * fake messages from real members, which is worse than silence — so
+       * they are off unless somebody turns them on. */
+      if (state.chatter && a.characterId && Math.random()>.9){ const text=CHATTER[Math.floor(Math.random()*CHATTER.length)];
         a.say={text,left:4.5};
         w.chat.push({who:a.name, text, tint:TINTS[Math.abs(a.id.length*7+a.name.length)%TINTS.length], at:w.t});
         if (w.chat.length>60) w.chat.shift(); }
@@ -2265,7 +2269,8 @@ function sadTrom() {
 const SAVE_KEY = 'resoverse:v1';
 const blankSave = () => ({
   playerId: null, xp: 0, unlocked: [], visited: [], scores: [], extras: false,
-  played: [], said: false, sound: true, volume: .7, names: true, custom: [], beat: {}, equip: {},
+  played: [], said: false, sound: true, volume: .7, names: true, chatter: false,
+  custom: [], beat: {}, equip: {},
 });
 
 let state = blankSave();
@@ -3151,6 +3156,10 @@ const PANELS = {
     rows.appendChild(vol);
     rows.appendChild(toggle('Name tags', 'Show names over people on the campus',
       () => state.names, v => { state.names = v; }));
+    rows.appendChild(toggle('Scripted chatter',
+      'Let the members standing about say things on their own',
+      () => state.chatter, v => { state.chatter = v;
+        if (!v && world) world.actors.forEach(a => { a.say = null; }); }));
     rows.appendChild(toggle('Fill the square', 'Add a background crowd of nobody in particular',
       () => state.extras, v => { state.extras = v; save();
         if (world) { const a = world.areaId, c = world.clock, ch = world.chat;
